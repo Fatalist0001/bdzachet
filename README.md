@@ -1208,3 +1208,225 @@ CREATE INDEX idx_logs_time ON logs USING BRIN(timestamp);
 
 * Не индексируйте всё подряд — это увеличит издержки на обновление данных.
 * Используйте `EXPLAIN ANALYZE`, чтобы проверить, используется ли индекс.
+
+
+# Практика
+
+Вариант 1
+
+## Описание предметной области
+
+Компания имеет различные филиалы по всей стране. Каждый филиал характеризуется названием, адресом и телефоном. Деятельность компании организована следующим образом: в компанию обращаются различные лица с целью заключения договора о страховании. В зависимости от принимаемых на страхование объектов и страхуемых рисков договор заключается по определенному виду страхования (например, страхование автотранспорта от угона, страхование домашнего имущества, добровольное медицинское страхование). При заключении договора фиксируется дата заключения, страховая сумма, вид страхования, тарифная ставка и филиал, в котором заключался договор. Нужно учесть, что договоры заключают страховые агенты. Помимо информации об агентах (фамилия, имя, отчество, адрес, телефон), нужно еще хранить филиал, в котором работают агенты. Кроме того, исходя из БД, нужно иметь возможность рассчитывать заработную плату агентам.
+
+Возможный набор сущностей (обратите внимание на отношения между таблицами и на задания ниже, возможно, необходимо будет изменить структуру таблиц):
+
+- Клиент (Код клиента, Фамилия, Имя, Отчество, Адрес, Телефон).
+
+- Договоры (Номер договора, Дата заключения, Страховая сумма, Тарифная ставка, Код филиала, Код вида страхования).
+
+- Вид страхования (Код вида страхования, Наименование).
+
+- Филиал (Код филиала, Наименование филиала, Адрес, Телефон).
+
+- Агент (Фамилия, Имя, Отчество, Адрес, Телефон).
+
+
+## Задание:
+
+1. Создать БД, схемы и таблицы с ограничениями целостности. 
+
+2. Написать хранимую процедуру, которая рассчитает заработную плату Агентов за текущий месяц.  Заработная плата составляет некоторый процент от страхового платежа (страховой платѐж – это страховая сумма, умноженная на тарифную ставку). Процент зависит от вида страхования, по которому заключен договор  (например, страхование автотранспорта от угона 2%, страхование домашнего имущества 1%, добровольное медицинское страхование 2%).
+
+(Написать триггер, который позволяет изменять данные договора, только если он был заключен не позднее трех дней от текущей даты.)
+
+3. Создать представление.
+
+4. Создать составной фильтрованный (частичный) индекс с включенными столбцами
+
+---
+
+
+### 1. Создание БД и схемы
+
+```sql
+-- Создание базы данных
+CREATE DATABASE testVar1;
+
+-- Подключение к новой базе
+\c testvar1
+
+-- Создание схемы
+CREATE SCHEMA testVar1;
+
+-- Проверка текущей схемы поиска
+SHOW search_path;
+
+-- Установка схемы по умолчанию
+SET search_path TO testVar1;
+```
+
+
+### Создание таблиц
+```sql
+-- Таблица клиентов
+CREATE TABLE client (
+    client_id SERIAL PRIMARY KEY,
+    last_name VARCHAR(50),
+    first_name VARCHAR(50),
+    middle_name VARCHAR(50),
+    address TEXT,
+    phone VARCHAR(20)
+);
+
+-- Таблица филиалов
+CREATE TABLE branch (
+    branch_id SERIAL PRIMARY KEY,
+    name VARCHAR(100),
+    address TEXT,
+    phone VARCHAR(20)
+);
+
+-- Таблица видов страхования
+CREATE TABLE insurance_type (
+    type_id SERIAL PRIMARY KEY,
+    name VARCHAR(100)
+);
+
+-- Таблица агентов
+CREATE TABLE agent (
+    agent_id SERIAL PRIMARY KEY,
+    last_name VARCHAR(50),
+    first_name VARCHAR(50),
+    middle_name VARCHAR(50),
+    address TEXT,
+    phone VARCHAR(20),
+    branch_id INTEGER REFERENCES branch(branch_id)
+);
+
+-- Таблица договоров
+CREATE TABLE contract (
+    contract_id SERIAL PRIMARY KEY,
+    contract_date DATE NOT NULL,
+    insurance_amount NUMERIC(15, 2) NOT NULL,
+    rate NUMERIC(5, 2) NOT NULL, -- тарифная ставка (в процентах, например, 2.5)
+    branch_id INTEGER REFERENCES branch(branch_id),
+    type_id INTEGER REFERENCES insurance_type(type_id),
+    client_id INTEGER REFERENCES client(client_id),
+    agent_id INTEGER REFERENCES agent(agent_id)
+);
+
+```
+
+### Вставка элементов в таблицы
+```sql
+INSERT INTO таблица (столбец1, столбец2) VALUES
+(Первая строка для столбец1, первая строка для столбец2)
+(Вторая строка для столбец1, вторая строка для столбец2)
+```
+
+### Важно соблюдать порядок вставки:
+
+- insurance_type, branch — независимые справочники.
+
+- client, agent — ссылаются на филиалы.
+
+- contract — зависит от всех остальных.
+
+### 2.
+
+```sql
+CREATE TABLE salary (
+    agent_id INTEGER,
+    month DATE,
+    amount NUMERIC(15,2)
+);
+
+
+
+CREATE OR REPLACE PROCEDURE calculate_salary_current_month_proc()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- Удалим старые данные за текущий месяц
+    DELETE FROM salary
+    WHERE DATE_TRUNC('month', month) = DATE_TRUNC('month', CURRENT_DATE);
+
+    -- Вставим зарплаты по виду страхования 1 (Автострахование, 2%)
+    INSERT INTO salary (agent_id, month, amount)
+    SELECT 
+        agent_id,
+        DATE_TRUNC('month', CURRENT_DATE),
+        SUM(insurance_amount * rate / 100 * 0.02)
+    FROM contract
+    WHERE type_id = 1
+      AND DATE_TRUNC('month', contract_date) = DATE_TRUNC('month', CURRENT_DATE)
+    GROUP BY agent_id;
+
+    -- Вставим зарплаты по виду страхования 2 (Имущество, 1%)
+    INSERT INTO salary (agent_id, month, amount)
+    SELECT 
+        agent_id,
+        DATE_TRUNC('month', CURRENT_DATE),
+        SUM(insurance_amount * rate / 100 * 0.01)
+    FROM contract
+    WHERE type_id = 2
+      AND DATE_TRUNC('month', contract_date) = DATE_TRUNC('month', CURRENT_DATE)
+    GROUP BY agent_id;
+
+    -- Вставим зарплаты по виду страхования 3 (Медицина, 2%)
+    INSERT INTO salary (agent_id, month, amount)
+    SELECT 
+        agent_id,
+        DATE_TRUNC('month', CURRENT_DATE),
+        SUM(insurance_amount * rate / 100 * 0.02)
+    FROM contract
+    WHERE type_id = 3
+      AND DATE_TRUNC('month', contract_date) = DATE_TRUNC('month', CURRENT_DATE)
+    GROUP BY agent_id;
+END;
+$$;
+
+
+
+CALL calculate_salary_current_month_proc();
+```
+
+### 3. Представление
+
+Показывает номер договора, дату, сумму, тариф, вид страхования и агента
+
+```sql
+CREATE OR REPLACE VIEW simple_contract_view AS
+SELECT
+    c.contract_id,
+    c.contract_date,
+    c.insurance_amount,
+    c.rate,
+    it.name AS insurance_type,
+    a.last_name AS agent_last_name
+FROM
+    contract c
+JOIN insurance_type it ON it.type_id = c.type_id
+JOIN agent a ON a.agent_id = c.agent_id;
+
+
+
+SELECT * FROM simple_contract_view;
+
+
+
+\d+ simple_contract_view
+```
+
+### 4. Индекс
+
+Индекс для ускорения запросов, которые ищут договоры агентов, заключенные с 2025-01-01 и позже.
+
+Запросы могут быстро получать суммы и тарифы без обращения к таблице
+
+```sql
+CREATE INDEX idx_contract_agent_date_partial
+ON contract (agent_id, contract_date)
+INCLUDE (insurance_amount, rate)
+WHERE contract_date >= '2025-01-01';
+```
